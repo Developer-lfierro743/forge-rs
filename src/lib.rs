@@ -29,6 +29,14 @@ pub struct ModManifest {
     pub compatibility: Option<Compatibility>,
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub modules: Vec<ModuleEntry>,
+    #[serde(default)]
+    pub injections: Vec<InjectionEntry>,
+    #[serde(default)]
+    pub post_build: Vec<PostBuildEntry>,
+    #[serde(default)]
+    pub crates: Vec<CrateEntry>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -47,6 +55,54 @@ pub struct Compatibility {
 pub struct Dependency {
     pub id: String,
     pub version: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModuleEntry {
+    pub id: String,
+    pub file: String,
+    pub name: String,
+    pub source: String,
+    #[serde(default)]
+    pub visibility: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Binding {
+    pub name: String,
+    #[serde(rename = "ty")]
+    pub ty: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct InjectionEntry {
+    pub id: String,
+    #[serde(rename = "kind")]
+    pub kind: String,
+    pub target: Option<String>,
+    pub hook: Option<String>,
+    #[serde(default)]
+    pub hook_version: Option<u32>,
+    pub helper: String,
+    pub bindings: Vec<Binding>,
+    #[serde(default)]
+    pub cancellable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PostBuildEntry {
+    pub crate_: String,
+    pub bin: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CrateEntry {
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub dependent: Option<String>,
 }
 
 impl ModManifest {
@@ -728,4 +784,157 @@ fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+// ─── GitHub Registry Client ─────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GitHubRelease {
+    pub tag_name: String,
+    pub name: String,
+    pub prerelease: bool,
+    pub assets: Vec<GitHubAsset>,
+    pub body: Option<String>,
+    pub published_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GitHubAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistryModInfo {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub download_url: String,
+    pub file_size: u64,
+    pub prerelease: bool,
+    pub published_at: Option<String>,
+}
+
+pub struct RegistryClient {
+    client: reqwest::Client,
+    owner: String,
+    repo: String,
+}
+
+impl RegistryClient {
+    pub fn new(owner: &str, repo: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        }
+    }
+
+    pub fn horizon() -> Self {
+        Self::new("horizon-rust", "horizon-mods")
+    }
+
+    pub async fn list_mods(&self) -> Result<Vec<RegistryModInfo>> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/releases",
+            self.owner, self.repo
+        );
+        let releases: Vec<GitHubRelease> = self
+            .client
+            .get(&url)
+            .header("User-Agent", "forge-rs")
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let mut mods = Vec::new();
+        for release in releases {
+            for asset in release.assets {
+                if asset.name.ends_with(".hnmod") || asset.name.ends_with(".hmod") {
+                    let base = asset.name
+                        .trim_end_matches(".hnmod")
+                        .trim_end_matches(".hmod")
+                        .to_string();
+                    // Strip version suffix: "mod_menu-0.3.0" -> "mod_menu"
+                    let mod_id = if let Some((name, _ver)) = base.rsplit_once('-') {
+                        if _ver.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                            name.to_string()
+                        } else {
+                            base
+                        }
+                    } else {
+                        base
+                    };
+                    mods.push(RegistryModInfo {
+                        id: mod_id,
+                        name: release.name.clone(),
+                        version: release.tag_name.clone(),
+                        description: release.body.clone(),
+                        download_url: asset.browser_download_url.clone(),
+                        file_size: asset.size,
+                        prerelease: release.prerelease,
+                        published_at: release.published_at.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(mods)
+    }
+
+    pub async fn search(&self, query: &str) -> Result<Vec<RegistryModInfo>> {
+        let all = self.list_mods().await?;
+        let q = query.to_lowercase();
+        Ok(all
+            .into_iter()
+            .filter(|m| {
+                m.id.contains(&q)
+                    || m.name.to_lowercase().contains(&q)
+                    || m.description
+                        .as_ref()
+                        .map(|d| d.to_lowercase().contains(&q))
+                        .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    pub async fn install_mod(
+        &self,
+        mod_info: &RegistryModInfo,
+        dest_dir: &Path,
+        force: bool,
+    ) -> Result<PathBuf> {
+        let filename = mod_info.download_url.rsplit('/').next().unwrap_or("mod.hnmod");
+        let dest = dest_dir.join(filename);
+
+        if dest.exists() && !force {
+            anyhow::bail!(
+                "Mod file '{}' already exists. Use --force to overwrite.",
+                dest.display()
+            );
+        }
+
+        println!("Downloading {} v{}...", mod_info.id, mod_info.version);
+        let bytes = self
+            .client
+            .get(&mod_info.download_url)
+            .header("User-Agent", "forge-rs")
+            .send()
+            .await?
+            .bytes()
+            .await?;
+
+        fs::create_dir_all(dest_dir)?;
+        fs::write(&dest, &bytes)?;
+
+        println!(
+            "✓ Downloaded {} ({} bytes)",
+            dest.display(),
+            bytes.len()
+        );
+        Ok(dest)
+    }
 }

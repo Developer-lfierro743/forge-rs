@@ -9,3 +9,8 @@ real-mods/
 
 # Pack artifacts
 *.fpack
+
+# Test artifacts
+test-mods/
+*.fpack
+installed-mods/

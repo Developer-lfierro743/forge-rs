@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use forge_rs::{init_mod, pack_modpack, ModpackManifest, ModRegistry};
+use forge_rs::{init_mod, pack_modpack, ModpackManifest, ModRegistry, RegistryClient};
 use std::fs;
 use std::path::PathBuf;
 
@@ -58,9 +58,37 @@ enum Commands {
         /// Path to .fpack file
         path: PathBuf,
     },
+    /// Browse Horizon mod registry
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommands,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+#[derive(Subcommand)]
+enum RegistryCommands {
+    /// List all available mods from the Horizon registry
+    List,
+    /// Search for mods by name, ID, or description
+    Search {
+        /// Search query
+        query: String,
+    },
+    /// Download and install a mod from the registry
+    Install {
+        /// Mod ID to install
+        mod_id: String,
+        /// Output directory (default: ./mods)
+        #[arg(short, long, default_value = "mods")]
+        output: PathBuf,
+        /// Overwrite existing file
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -200,6 +228,56 @@ fn main() -> anyhow::Result<()> {
             }
 
             println!("\n✅ Modpack looks valid!");
+        }
+
+        Commands::Registry { command } => {
+            let client = RegistryClient::horizon();
+            match command {
+                RegistryCommands::List => {
+                    println!("Fetching Horizon mod registry...\n");
+                    let mods = client.list_mods().await?;
+                    if mods.is_empty() {
+                        println!("No mods found in registry.");
+                        return Ok(());
+                    }
+                    println!("{:<20} {:<15} {:<10} {}", "ID", "VERSION", "SIZE", "NAME");
+                    println!("{}", "-".repeat(70));
+                    for m in &mods {
+                        let size_kb = m.file_size as f64 / 1024.0;
+                        println!(
+                            "{:<20} {:<15} {:<10.1}K {}",
+                            m.id, m.version, size_kb, m.name
+                        );
+                    }
+                    println!("\nTotal: {} mods", mods.len());
+                }
+                RegistryCommands::Search { query } => {
+                    println!("Searching for: {}\n", query);
+                    let results = client.search(&query).await?;
+                    if results.is_empty() {
+                        println!("No mods matched your search.");
+                        return Ok(());
+                    }
+                    println!("{:<20} {:<15} {}", "ID", "VERSION", "NAME");
+                    println!("{}", "-".repeat(60));
+                    for m in &results {
+                        println!("{:<20} {:<15} {}", m.id, m.version, m.name);
+                    }
+                    println!("\nFound: {} mods", results.len());
+                }
+                RegistryCommands::Install { mod_id, output, force } => {
+                    println!("Looking up mod: {}\n", mod_id);
+                    let all = client.list_mods().await?;
+                    let mod_info = all.into_iter().find(|m| m.id == mod_id);
+                    let Some(mod_info) = mod_info else {
+                        anyhow::bail!("Mod '{}' not found in registry", mod_id);
+                    };
+                    println!("Found: {} v{}\n", mod_info.name, mod_info.version);
+                    fs::create_dir_all(&output)?;
+                    let dest = client.install_mod(&mod_info, &output, force).await?;
+                    println!("\n✅ Installed to: {}", dest.display());
+                }
+            }
         }
     }
 
