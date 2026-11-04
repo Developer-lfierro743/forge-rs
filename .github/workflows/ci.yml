@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build forge-rs CLI
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Verify CLI help
+        run: cargo run -- --help
+
+      - name: Test init command
+        run: |
+          mkdir -p /tmp/test-init-ci
+          cargo run -- init test_mod --path /tmp/test-init-ci --force
+          test -f /tmp/test-init-ci/test_mod/horizon-mixin.toml
+
+      - name: Verify manifest parsing
+        run: |
+          cargo run -- list --path /tmp/test-init-ci
+
+      - name: Test registry client (list)
+        run: |
+          cargo run -- registry list | head -5
+
+      - name: Test search
+        run: |
+          cargo run -- registry search hud | head -10
+
+      - name: Validate GUI mod manifest
+        run: |
+          cargo run -- list --path forge-rs-gui
+
+      - name: Build GUI mod .hnmod
+        run: |
+          cargo run -- build forge-rs-gui --output forge-rs-gui/forge_rs_gui.hnmod --force
+
+      - name: Verify .hnmod structure
+        run: |
+          test -f forge-rs-gui/forge_rs_gui.hnmod
+          unzip -l forge-rs-gui/forge_rs_gui.hnmod | grep -q "horizon-native.json"
+          unzip -l forge-rs-gui/forge_rs_gui.hnmod | grep -q "horizon-mixin.toml"
+          echo "✓ .hnmod structure valid"
+
+      - name: Upload GUI mod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge_rs_gui.hnmod
+          path: forge-rs-gui/forge_rs_gui.hnmod
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
