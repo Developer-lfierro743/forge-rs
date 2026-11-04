@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use forge_rs::{init_mod, ModRegistry};
+use forge_rs::{init_mod, pack_modpack, ModpackManifest, ModRegistry};
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -40,6 +41,22 @@ enum Commands {
         /// Overwrite existing directory
         #[arg(long)]
         force: bool,
+    },
+    /// Create a .fpack modpack from a directory with modpack.toml
+    Pack {
+        /// Path to modpack directory (must contain modpack.toml)
+        path: PathBuf,
+        /// Output .fpack file path
+        #[arg(short, long, default_value = "modpack.fpack")]
+        output: PathBuf,
+        /// Overwrite existing output file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Validate a .fpack modpack
+    CheckPack {
+        /// Path to .fpack file
+        path: PathBuf,
     },
 }
 
@@ -143,6 +160,46 @@ fn main() -> anyhow::Result<()> {
         Commands::Init { id, path, force } => {
             let mod_dir = init_mod(&id, &path, force)?;
             println!("\n🎉 Mod project ready at: {}", mod_dir.display());
+        }
+
+        Commands::Pack { path, output, force } => {
+            println!("Packing modpack from {}...", path.display());
+            let pack_path = pack_modpack(&path, &output, force)?;
+            println!("✅ Modpack ready: {}", pack_path.display());
+        }
+
+        Commands::CheckPack { path } => {
+            println!("Checking modpack: {}", path.display());
+            // Extract and validate
+            let temp_dir = std::env::temp_dir().join("forge-rs-check");
+            let _ = fs::remove_dir_all(&temp_dir);
+            fs::create_dir_all(&temp_dir)?;
+
+            let file = fs::File::open(&path)?;
+            let mut zip = zip::ZipArchive::new(file)?;
+            zip.extract(&temp_dir)?;
+
+            let manifest = ModpackManifest::from_dir(&temp_dir)?;
+            println!("  ID:          {}", manifest.id);
+            println!("  Name:        {}", manifest.name);
+            println!("  Version:     {}", manifest.version);
+            if let Some(desc) = manifest.description {
+                println!("  Description: {}", desc);
+            }
+            println!("  Mods:        {}", manifest.mods.len());
+            for m in &manifest.mods {
+                println!("    - {} v{} ({})", m.id, m.version, m.source);
+            }
+
+            // Check all mods are present
+            for m in &manifest.mods {
+                let mod_path = temp_dir.join(&m.path);
+                if !mod_path.exists() {
+                    println!("⚠ Missing mod file: {}", m.path);
+                }
+            }
+
+            println!("\n✅ Modpack looks valid!");
         }
     }
 

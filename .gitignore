@@ -6,3 +6,6 @@ real-mods/
 *.hnmod
 *.hmod
 *.fpack
+
+# Pack artifacts
+*.fpack

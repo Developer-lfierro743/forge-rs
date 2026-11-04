@@ -1,0 +1,14 @@
+[mod]
+id = "broken_mod"
+version = "0.1.0"
+priority = 100
+
+[[dependencies]]
+id = "nonexistent_mod"
+version = "99.0.0"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "broken_mod"
+source = "runtime.rs"

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -627,4 +628,104 @@ Cargo.lock
 Thumbs.db
 "#
     .to_string()
+}
+
+// ─── Modpack (.fpack) builder ───────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ModpackManifest {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub game: Option<String>,
+    pub mods: Vec<ModpackModEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ModpackModEntry {
+    pub id: String,
+    pub version: String,
+    pub source: String,
+    pub path: String,
+}
+
+impl ModpackManifest {
+    pub fn from_dir(dir: &Path) -> Result<Self> {
+        let manifest_path = dir.join("modpack.toml");
+        if !manifest_path.exists() {
+            anyhow::bail!("No modpack.toml found in {}", dir.display());
+        }
+        let content = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {}", manifest_path.display()))?;
+        let manifest: ModpackManifest = toml::from_str(&content)
+            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        Ok(manifest)
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let toml_str = toml::to_string(self)
+            .context("serializing modpack manifest")?;
+        fs::write(path, toml_str)?;
+        Ok(())
+    }
+}
+
+pub fn pack_modpack(modpack_dir: &Path, output: &Path, force: bool) -> Result<PathBuf> {
+    if output.exists() && !force {
+        anyhow::bail!("Output file '{}' already exists. Use --force to overwrite.", output.display());
+    }
+
+    let manifest = ModpackManifest::from_dir(modpack_dir)?;
+    let mut entries: Vec<(PathBuf, String)> = Vec::new();
+
+    // Add manifest
+    entries.push((modpack_dir.join("modpack.toml"), "modpack.toml".to_string()));
+
+    // Add each mod file/dir referenced in manifest
+    for entry in &manifest.mods {
+        let source_path = modpack_dir.join(&entry.source);
+        if !source_path.exists() {
+            anyhow::bail!("Mod source not found: {}", source_path.display());
+        }
+        if source_path.is_dir() {
+            for file in walk_dir(&source_path)? {
+                let rel = file.strip_prefix(&source_path).unwrap_or(&file);
+                entries.push((file.clone(), format!("mods/{}/{}", entry.id, rel.display())));
+            }
+        } else {
+            entries.push((source_path, format!("mods/{}", entry.source)));
+        }
+    }
+
+    // Create zip
+    let file = fs::File::create(output)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::<()>::default();
+
+    for (src, dest) in &entries {
+        let content = fs::read(src)?;
+        zip.start_file(dest, options)?;
+        zip.write_all(&content)?;
+    }
+
+    zip.finish()?;
+
+    println!("✓ Packed {} mods into {}", manifest.mods.len(), output.display());
+    println!("  {} ({} bytes)", manifest.id, fs::metadata(output)?.len());
+    Ok(output.to_path_buf())
+}
+
+fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk_dir(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
