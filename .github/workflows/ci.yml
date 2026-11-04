@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, master]
 
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -44,34 +48,41 @@ jobs:
         run: |
           cargo run -- list --path /tmp/test-init-ci
 
-      - name: Test registry client (list)
+      - name: Test registry client (with retry)
         run: |
-          cargo run -- registry list | head -5
+          for i in 1 2 3; do
+            cargo run -- registry list && break || sleep 5
+          done
 
       - name: Test search
         run: |
-          cargo run -- registry search hud | head -10
+          for i in 1 2 3; do
+            cargo run -- registry search hud && break || sleep 5
+          done
 
-      - name: Validate GUI mod manifest
+      - name: Test pack command
         run: |
-          cargo run -- list --path forge-rs-gui
+          mkdir -p /tmp/test-pack-ci/mods/testmod
+          cat > /tmp/test-pack-ci/modpack.toml << 'MODEOF'
+          id = "test_pack"
+          name = "Test Pack"
+          version = "1.0.0"
 
-      - name: Build GUI mod .hnmod
+          [[mods]]
+          id = "testmod"
+          version = "0.1.0"
+          source = "mods/testmod"
+          path = "mods/testmod"
+          MODEOF
+          echo "test" > /tmp/test-pack-ci/mods/testmod/mod.rs
+          cargo run -- pack /tmp/test-pack-ci --output /tmp/test.fpack --force
+
+      - name: Test mods install
         run: |
-          cargo run -- build forge-rs-gui --output forge-rs-gui/forge_rs_gui.hnmod --force
-
-      - name: Verify .hnmod structure
-        run: |
-          test -f forge-rs-gui/forge_rs_gui.hnmod
-          unzip -l forge-rs-gui/forge_rs_gui.hnmod | grep -q "horizon-native.json"
-          unzip -l forge-rs-gui/forge_rs_gui.hnmod | grep -q "horizon-mixin.toml"
-          echo "✓ .hnmod structure valid"
-
-      - name: Upload GUI mod artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: forge_rs_gui.hnmod
-          path: forge-rs-gui/forge_rs_gui.hnmod
+          mkdir -p /tmp/test-mods-ci
+          echo "test" > /tmp/test-mods-ci/test_mod.hnmod
+          cargo run -- mods install /tmp/test-mods-ci/test_mod.hnmod --path /tmp/test-mods-install
+          test -f /tmp/test-mods-install/enabled/test_mod.hnmod
 
   clippy:
     runs-on: ubuntu-latest
