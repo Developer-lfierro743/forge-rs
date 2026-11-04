@@ -938,3 +938,259 @@ impl RegistryClient {
         Ok(dest)
     }
 }
+
+// ─── .hnmod Builder ─────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HorizonNativeJson {
+    pub id: String,
+    pub version: String,
+    pub game: String,
+    pub horizon: String,
+    pub mixins: String,
+    pub schema: u32,
+}
+
+pub fn build_hnmod(
+    mod_dir: &Path,
+    output: &Path,
+    force: bool,
+    horizon_commit: Option<&str>,
+) -> Result<PathBuf> {
+    if output.exists() && !force {
+        anyhow::bail!("Output '{}' already exists. Use --force to overwrite.", output.display());
+    }
+
+    // Load manifest
+    let manifest_path = mod_dir.join("horizon-mixin.toml");
+    if !manifest_path.exists() {
+        anyhow::bail!("No horizon-mixin.toml found in {}", mod_dir.display());
+    }
+    let manifest = ModManifest::from_file(&manifest_path)?;
+
+    let mod_id = &manifest.mod_.id;
+    let version = &manifest.mod_.version;
+    let horizon_rev = manifest
+        .compatibility
+        .as_ref()
+        .and_then(|c| c.horizon_revision.clone())
+        .or_else(|| horizon_commit.map(|s| s.to_string()))
+        .unwrap_or_else(|| "latest".to_string());
+
+    // Create zip
+    let file = fs::File::create(output)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::<()>::default();
+
+    // 1. horizon-native.json
+    let native_json = HorizonNativeJson {
+        id: mod_id.clone(),
+        version: version.clone(),
+        game: "26.3".to_string(),
+        horizon: horizon_rev.clone(),
+        mixins: "latest".to_string(),
+        schema: 1,
+    };
+    let json_bytes = serde_json::to_string_pretty(&native_json)?;
+    zip.start_file("horizon-native.json", options)?;
+    zip.write_all(json_bytes.as_bytes())?;
+
+    // 2. Copy mixins/<mod_id>/* from mod_dir
+    let mixins_src = mod_dir.join("mixins").join(mod_id);
+    if !mixins_src.exists() {
+        anyhow::bail!("Mixins directory not found: {}", mixins_src.display());
+    }
+
+    let mut added_toml = false;
+    for entry in walk_dir(&mixins_src)? {
+        let rel = entry.strip_prefix(&mixins_src).unwrap_or(&entry);
+        let dest = format!("mixins/{}/{}", mod_id, rel.display());
+        let content = fs::read(&entry)?;
+        zip.start_file(dest, options)?;
+        zip.write_all(&content)?;
+        if rel.to_string_lossy() == "horizon-mixin.toml" {
+            added_toml = true;
+        }
+    }
+
+    // 3. Include horizon-mixin.toml if not already in mixins dir
+    if !added_toml {
+        let toml_bytes = fs::read(&manifest_path)?;
+        zip.start_file(format!("mixins/{}/horizon-mixin.toml", mod_id), options)?;
+        zip.write_all(&toml_bytes)?;
+    }
+
+    zip.finish()?;
+
+    let size = fs::metadata(output)?.len();
+    println!("✓ Built {} v{}", mod_id, version);
+    println!("  {} ({} bytes)", output.display(), size);
+    println!("  horizon: {}", horizon_rev);
+    println!("  game: 26.3");
+    println!("  schema: 1");
+
+    Ok(output.to_path_buf())
+}
+
+// ─── Installed Mods Manager ─────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct InstalledModsManager {
+    pub mods_dir: PathBuf,
+    pub enabled: HashMap<String, PathBuf>,
+    pub disabled: HashMap<String, PathBuf>,
+}
+
+impl InstalledModsManager {
+    pub fn new(mods_dir: PathBuf) -> Self {
+        Self {
+            mods_dir,
+            enabled: HashMap::new(),
+            disabled: HashMap::new(),
+        }
+    }
+
+    pub fn load(&mut self) -> Result<()> {
+        self.enabled.clear();
+        self.disabled.clear();
+
+        let enabled_dir = self.mods_dir.join("enabled");
+        let disabled_dir = self.mods_dir.join("disabled");
+
+        if enabled_dir.exists() {
+            for entry in fs::read_dir(enabled_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map(|e| e == "hnmod" || e == "hmod").unwrap_or(false) {
+                    if let Some(stem) = path.file_stem() {
+                        let id = stem.to_string_lossy().to_lowercase();
+                        self.enabled.insert(id, path);
+                    }
+                }
+            }
+        }
+
+        if disabled_dir.exists() {
+            for entry in fs::read_dir(disabled_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map(|e| e == "hnmod" || e == "hmod").unwrap_or(false) {
+                    if let Some(stem) = path.file_stem() {
+                        let id = stem.to_string_lossy().to_lowercase();
+                        self.disabled.insert(id, path);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn install(&mut self, source: &Path, enable: bool) -> Result<PathBuf> {
+        let dest_dir = if enable {
+            self.mods_dir.join("enabled")
+        } else {
+            self.mods_dir.join("disabled")
+        };
+
+        fs::create_dir_all(&dest_dir)?;
+
+        let filename = source.file_name().unwrap_or_default();
+        let dest = dest_dir.join(filename);
+
+        if dest.exists() {
+            fs::remove_file(&dest)?;
+        }
+
+        fs::copy(source, &dest)?;
+        let _ = self.load()?;
+
+        println!("✓ Installed to {}", dest.display());
+        Ok(dest)
+    }
+
+    pub fn uninstall(&mut self, mod_id: &str) -> Result<()> {
+        let _ = self.load();
+
+        if let Some(path) = self.enabled.remove(mod_id) {
+            fs::remove_file(&path)?;
+            println!("✓ Uninstalled enabled mod: {}", mod_id);
+            return Ok(());
+        }
+
+        if let Some(path) = self.disabled.remove(mod_id) {
+            fs::remove_file(&path)?;
+            println!("✓ Uninstalled disabled mod: {}", mod_id);
+            return Ok(());
+        }
+
+        anyhow::bail!("Mod '{}' not found", mod_id);
+    }
+
+    pub fn enable(&mut self, mod_id: &str) -> Result<()> {
+        let _ = self.load();
+
+        if let Some(path) = self.disabled.remove(mod_id) {
+            let dest = self.mods_dir.join("enabled").join(
+                path.file_name().unwrap_or_default()
+            );
+            fs::create_dir_all(self.mods_dir.join("enabled"))?;
+            fs::rename(&path, &dest)?;
+            let _ = self.load();
+            println!("✓ Enabled mod: {}", mod_id);
+            Ok(())
+        } else if self.enabled.contains_key(mod_id) {
+            println!("Mod '{}' is already enabled", mod_id);
+            Ok(())
+        } else {
+            anyhow::bail!("Mod '{}' not found", mod_id);
+        }
+    }
+
+    pub fn disable(&mut self, mod_id: &str) -> Result<()> {
+        let _ = self.load();
+
+        if let Some(path) = self.enabled.remove(mod_id) {
+            let dest = self.mods_dir.join("disabled").join(
+                path.file_name().unwrap_or_default()
+            );
+            fs::create_dir_all(self.mods_dir.join("disabled"))?;
+            fs::rename(&path, &dest)?;
+            let _ = self.load();
+            println!("✓ Disabled mod: {}", mod_id);
+            Ok(())
+        } else if self.disabled.contains_key(mod_id) {
+            println!("Mod '{}' is already disabled", mod_id);
+            Ok(())
+        } else {
+            anyhow::bail!("Mod '{}' not found", mod_id);
+        }
+    }
+
+    pub fn list(&self) {
+        println!("Mods directory: {}\n", self.mods_dir.display());
+
+        if !self.enabled.is_empty() {
+            println!("Enabled mods ({}):", self.enabled.len());
+            for (id, path) in &self.enabled {
+                let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                println!("  ✓ {:<25} ({} bytes)", id, size);
+            }
+            println!();
+        }
+
+        if !self.disabled.is_empty() {
+            println!("Disabled mods ({}):", self.disabled.len());
+            for (id, path) in &self.disabled {
+                let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                println!("  ✗ {:<25} ({} bytes)", id, size);
+            }
+            println!();
+        }
+
+        let total = self.enabled.len() + self.disabled.len();
+        if total == 0 {
+            println!("No mods installed.");
+        }
+    }
+}

@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
-use forge_rs::{init_mod, pack_modpack, ModpackManifest, ModRegistry, RegistryClient};
+use forge_rs::{
+    build_hnmod, init_mod, pack_modpack, InstalledModsManager, ModpackManifest, ModRegistry,
+    RegistryClient,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,6 +45,20 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Build a .hnmod from a mod project directory
+    Build {
+        /// Path to mod project directory (must contain horizon-mixin.toml)
+        path: PathBuf,
+        /// Output .hnmod file path
+        #[arg(short, long, default_value = "mod.hnmod")]
+        output: PathBuf,
+        /// Overwrite existing output file
+        #[arg(long)]
+        force: bool,
+        /// Horizon commit to pin (default: read from manifest)
+        #[arg(long)]
+        horizon_commit: Option<String>,
+    },
     /// Create a .fpack modpack from a directory with modpack.toml
     Pack {
         /// Path to modpack directory (must contain modpack.toml)
@@ -58,10 +75,60 @@ enum Commands {
         /// Path to .fpack file
         path: PathBuf,
     },
+    /// Manage installed mods
+    Mods {
+        #[command(subcommand)]
+        command: ModsCommands,
+    },
     /// Browse Horizon mod registry
     Registry {
         #[command(subcommand)]
         command: RegistryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModsCommands {
+    /// List installed mods
+    List {
+        /// Path to mods directory
+        #[arg(short, long, default_value = "mods")]
+        path: PathBuf,
+    },
+    /// Install a .hnmod/.hmod file
+    Install {
+        /// Path to .hnmod/.hmod file
+        source: PathBuf,
+        /// Mods directory
+        #[arg(short, long, default_value = "mods")]
+        path: PathBuf,
+        /// Install as disabled
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Uninstall a mod
+    Uninstall {
+        /// Mod ID to uninstall
+        mod_id: String,
+        /// Mods directory
+        #[arg(short, long, default_value = "mods")]
+        path: PathBuf,
+    },
+    /// Enable a disabled mod
+    Enable {
+        /// Mod ID to enable
+        mod_id: String,
+        /// Mods directory
+        #[arg(short, long, default_value = "mods")]
+        path: PathBuf,
+    },
+    /// Disable an enabled mod
+    Disable {
+        /// Mod ID to disable
+        mod_id: String,
+        /// Mods directory
+        #[arg(short, long, default_value = "mods")]
+        path: PathBuf,
     },
 }
 
@@ -181,13 +248,19 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if duplicates.is_empty() && missing.is_empty() {
-                println!("\n✓ Mod pack looks good!");
+                println!("\n✅ Mod pack looks good!");
             }
         }
 
         Commands::Init { id, path, force } => {
             let mod_dir = init_mod(&id, &path, force)?;
             println!("\n🎉 Mod project ready at: {}", mod_dir.display());
+        }
+
+        Commands::Build { path, output, force, horizon_commit } => {
+            println!("Building .hnmod from {}...", path.display());
+            let built = build_hnmod(&path, &output, force, horizon_commit.as_deref())?;
+            println!("\n✅ Built: {}", built.display());
         }
 
         Commands::Pack { path, output, force } => {
@@ -228,6 +301,67 @@ async fn main() -> anyhow::Result<()> {
             }
 
             println!("\n✅ Modpack looks valid!");
+        }
+
+        Commands::Mods { command } => {
+            let _ = std::env::current_dir()?; // mods_dir unused;
+            match command {
+                ModsCommands::List { path } => {
+                    let mut manager = InstalledModsManager::new(path);
+                    manager.load()?;
+                    manager.list();
+                }
+                ModsCommands::Install { source, path, disable } => {
+                    if !source.exists() {
+                        anyhow::bail!("Source file not found: {}", source.display());
+                    }
+                    let mut manager = InstalledModsManager::new(path);
+                    manager.load()?;
+                    // Extract real mod ID from .hnmod manifest and rename to mod_id.hnmod
+                    let mod_id = if let Ok(mut archive) = zip::ZipArchive::new(std::fs::File::open(&source).unwrap()) {
+                        let mut found = None;
+                        for i in 0..archive.len() {
+                            if let Ok(mut entry) = archive.by_index(i) {
+                                let name = entry.name();
+                                if let Ok(name_str) = name {
+                                    if name_str.ends_with("horizon-mixin.toml") {
+                                        let mut buf = Vec::new();
+                                        std::io::copy(&mut entry, &mut buf).unwrap();
+                                        let toml_str = String::from_utf8_lossy(&buf);
+                                        if let Some(line) = toml_str.lines().find(|l| l.trim().starts_with("id =")) {
+                                            let id = line.split('=').nth(1).unwrap_or("").trim().trim_matches('"').to_lowercase();
+                                            found = Some(id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        found.unwrap_or_else(|| source.file_stem().unwrap_or_default().to_string_lossy().to_lowercase())
+                    } else {
+                        source.file_stem().unwrap_or_default().to_string_lossy().to_lowercase()
+                    };
+                    // Copy to a temp file with canonical name, then install that
+                    let ext = source.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                    let canonical = source.with_file_name(format!("{}{}", mod_id, ext));
+                    if !canonical.exists() {
+                        fs::copy(&source, &canonical)?;
+                    }
+                    manager.install(&canonical, !disable)?;
+                }
+                ModsCommands::Uninstall { mod_id, path } => {
+                    let mut manager = InstalledModsManager::new(path);
+                    manager.uninstall(&mod_id)?;
+                }
+                ModsCommands::Enable { mod_id, path } => {
+                    let mut manager = InstalledModsManager::new(path);
+                    manager.enable(&mod_id)?;
+                }
+                ModsCommands::Disable { mod_id, path } => {
+                    let mut manager = InstalledModsManager::new(path);
+                    manager.disable(&mod_id)?;
+                }
+            }
         }
 
         Commands::Registry { command } => {
