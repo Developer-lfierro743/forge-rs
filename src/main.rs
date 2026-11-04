@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use forge_rs::ModRegistry;
+use forge_rs::{init_mod, ModRegistry};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -30,13 +30,16 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
     },
-    /// Initialize a new mod project
+    /// Initialize a new Horizon native mod project
     Init {
-        /// Mod ID
+        /// Mod ID (used in manifest and code)
         id: String,
-        /// Output directory
+        /// Output directory for the new mod project
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
+        /// Overwrite existing directory
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -137,10 +140,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Init { id, path } => {
-            println!("Initializing new mod project: {}", id);
-            println!("Target directory: {}", path.display());
-            println!("\nTODO: generate horizon-mixin.toml template and src/ structure");
+        Commands::Init { id, path, force } => {
+            let mod_dir = init_mod(&id, &path, force)?;
+            println!("\n🎉 Mod project ready at: {}", mod_dir.display());
         }
     }
 

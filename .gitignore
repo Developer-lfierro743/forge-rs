@@ -1,0 +1,8 @@
+/target
+
+# Test artifacts
+test-real-mods/
+real-mods/
+*.hnmod
+*.hmod
+*.fpack
