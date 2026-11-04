@@ -80,10 +80,24 @@ enum Commands {
         #[command(subcommand)]
         command: ModsCommands,
     },
-    /// Browse Horizon mod registry
+    /// Download and install a mod from the registry into the mods folder
     Registry {
         #[command(subcommand)]
         command: RegistryCommands,
+    },
+    /// Install a mod from the registry directly into the mods folder
+    Install {
+        /// Mod ID to install from registry
+        mod_id: String,
+        /// Mods directory
+        #[arg(short, long, default_value = "mods")]
+        path: PathBuf,
+        /// Install as disabled
+        #[arg(long)]
+        disable: bool,
+        /// Overwrite existing file
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -409,9 +423,61 @@ async fn main() -> anyhow::Result<()> {
                     println!("Found: {} v{}\n", mod_info.name, mod_info.version);
                     fs::create_dir_all(&output)?;
                     let dest = client.install_mod(&mod_info, &output, force).await?;
-                    println!("\n✅ Installed to: {}", dest.display());
+                    println!("\n✅ Downloaded to: {}", dest.display());
                 }
             }
+        }
+
+        Commands::Install { mod_id, path, disable, force } => {
+            println!("Installing '{}' from Horizon registry...\n", mod_id);
+            let client = RegistryClient::horizon();
+
+            // Lookup
+            let all = client.list_mods().await?;
+            let mod_info = all.into_iter().find(|m| m.id == mod_id);
+            let Some(mod_info) = mod_info else {
+                anyhow::bail!("Mod '{}' not found in registry", mod_id);
+            };
+            println!("Found: {} v{} ({} bytes)", mod_info.name, mod_info.version, mod_info.file_size);
+
+            // Download to temp
+            let temp_dir = std::env::temp_dir().join("forge-rs-install");
+            fs::create_dir_all(&temp_dir)?;
+            let downloaded = client.install_mod(&mod_info, &temp_dir, true).await?;
+
+            // Rename to canonical {mod_id}.hnmod
+            let ext = downloaded.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+            let canonical = downloaded.with_file_name(format!("{}{}", mod_id, ext));
+            if downloaded != canonical {
+                let _ = fs::rename(&downloaded, &canonical);
+            }
+
+            // Install to mods folder via manager (canonical name + enable/disable)
+            let mut manager = InstalledModsManager::new(path);
+            manager.load()?;
+
+            // Check if mod already exists (unless --force)
+            let target_dir = if disable { manager.mods_dir.join("disabled") } else { manager.mods_dir.join("enabled") };
+            let dest_path = target_dir.join(format!("{}{}", mod_id, ext));
+            if dest_path.exists() && !force {
+                anyhow::bail!(
+                    "Mod '{}' already exists at {}. Use --force to overwrite.",
+                    mod_id, dest_path.display()
+                );
+            }
+
+            let dest = manager.install(&canonical, !disable)?;
+
+            // Cleanup temp
+            let _ = fs::remove_file(&canonical);
+
+            println!("\n✅ Installed: {}", mod_info.id);
+            if disable {
+                println!("   Status: disabled");
+            } else {
+                println!("   Status: enabled");
+            }
+            println!("   Path:   {}", dest.display());
         }
     }
 
